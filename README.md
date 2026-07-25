@@ -91,18 +91,97 @@ Fixed with `pytest.approx()` against a value computed in the test itself
 ### Running it
 
 ```bash
-pytest
+pip install pydantic[email]
 ```
 
-All 6 tests pass. Deprecation warnings shown on run (`httpx`/`starlette`,
-Pydantic v1-style `class Config`) are noted but not fixed yet — neither
-affects correctness, both are candidates for cleanup before this goes
-further.
+Hit `ImportError: email-validator is not installed` on first run after
+adding `EmailStr` — this is why. Captured correctly in `requirements.txt`
+since it was installed before that file was regenerated.
+
+### Verified with a real rejected request, not just assumed
+
+Tested `POST /students` with `{"email": "not-an-email"}` and confirmed a
+`422 Unprocessable Content` with a specific message
+(`"An email address must have an @-sign"`) — rejected by Pydantic before
+`create_student`'s body ever ran, never touched the database.
+
+### 7. Why an empty enrollment list returns `200 []`, not `404`
+
+`GET /students/{id}/enrollments` initially raised a 404 when the result list
+was empty. That's wrong, and worth stating precisely why: a 404 should mean
+"this URL doesn't resolve to a resource" — it's a statement about the
+**resource's existence**, not about how much data is in it. A student who
+exists but hasn't enrolled in anything yet is a completely normal state
+(e.g. a freshman right after registering), not an error condition.
+
+Conflating "empty" with "not found" pushes a burden onto every client of
+this API: they'd have to inspect the 404's body to figure out whether it
+means "bad student_id, something's actually wrong" or "valid student, just
+no data yet" — which defeats the purpose of using status codes to carry
+meaning at all.
+
+**Rule applied:** 404 is reserved for cases where the *path itself* doesn't
+resolve (student_id doesn't exist). Once the resource is confirmed to
+exist, its contents — even zero items — are a normal `200` response.
 
 ---
 
-## Repo
+## Things that broke while building this (kept deliberately — this is the
+real debugging trail, and it's more interview-relevant than a clean
+success story)
 
-`.gitignore` excludes `venv/`, `grades.db`, `test.db`, and `__pycache__/` —
-confirmed via `git status` that none of these show up as untracked before
-the first commit.
+1. **`KeyError: 'Enrollement'`** — typo in a `relationship("Enrollment", ...)`
+   string argument in `models.py`. SQLAlchemy resolves relationship targets
+   by string name against a registry of defined classes (deferred lookup,
+   since the target class may not be defined yet at the point the string is
+   written) — a misspelled string fails silently until a mapper actually
+   tries to configure itself.
+2. **`InvalidRequestError: Don't know how to join to <Course>`** — the
+   transcript query's `SELECT` contained only aggregate expressions with no
+   named entity, so SQLAlchemy had no `FROM` to anchor the join to. Fixed
+   with `.select_from(Enrollment)`.
+3. **Pylance "cannot assign float to Column[Unknown]"** on
+   `enrollment.grade = grade` — a static-analysis false positive, not a
+   runtime bug. `Column` objects are the class-level type; SQLAlchemy's
+   instrumentation makes instance-level access return the real value, which
+   Pylance's type checker doesn't model. Real fix (optional): migrate models
+   to SQLAlchemy 2.0's `Mapped[]` / `mapped_column()` syntax, which types
+   correctly for static analysis.
+4. **`AttributeError: 'NoneType' object has no attribute 'id'`** in
+   `get_student_enrollments` — traced back to `POST /enrollments` silently
+   accepting a `course_id` that didn't exist in the `courses` table. Root
+   cause: **SQLite does not enforce foreign key constraints by default**,
+   even though `ForeignKey("courses.id")` is declared in `models.py` — that
+   declaration is metadata SQLAlchemy understands, not automatically
+   enforced by SQLite unless FK enforcement is turned on per-connection.
+   So an enrollment with a nonexistent `course_id` was created with no
+   error, and later `enrollment.course` (a lazy-loaded relationship) came
+   back `None`, crashing on `.id` access. Found this by manually testing
+   `POST /enrollments` with a bad `course_id`, not from a prompted test case.
+
+   **Fix, two layers (both worth having):**
+   - **Application-level (primary fix):** `create_enrollment` now checks
+     that both `student_id` and `course_id` exist before creating the row,
+     returning a clean `404` instead of allowing bad data in:
+     ```python
+     course = db.query(Course).filter(Course.id == enrollment_in.course_id).first()
+     if not course:
+         raise HTTPException(status_code=404, detail="Course not found")
+     ```
+   - **Database-level (defense in depth):** SQLite FK enforcement turned on
+     explicitly via a connection event listener in `database.py`:
+     ```python
+     from sqlalchemy import event
+
+     @event.listens_for(engine, "connect")
+     def set_sqlite_pragma(dbapi_connection, connection_record):
+         cursor = dbapi_connection.cursor()
+         cursor.execute("PRAGMA foreign_keys=ON")
+         cursor.close()
+     ```
+     With this on, SQLite itself would reject the bad insert even if the
+     application check were ever removed or bypassed — the same
+     `IntegrityError` type as the duplicate-enrollment case, so the
+     `except IntegrityError` block in `create_enrollment` now has to be
+     understood as covering two distinct causes (duplicate PK vs. bad FK),
+     not just one.
