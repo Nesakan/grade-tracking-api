@@ -1,0 +1,6 @@
+venv/
+grades.db
+__pycache__/
+*.pyc
+.env
+test.db
