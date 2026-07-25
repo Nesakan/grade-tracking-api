@@ -351,9 +351,7 @@ exist, its contents — even zero items — are a normal `200` response.
 
 ---
 
-## Things that broke while building this (kept deliberately — this is the
-real debugging trail, and it's more interview-relevant than a clean
-success story)
+## Things that broke while building this (kept deliberately)
 
 1. **`KeyError: 'Enrollement'`** — typo in a `relationship("Enrollment", ...)`
    string argument in `models.py`. SQLAlchemy resolves relationship targets
